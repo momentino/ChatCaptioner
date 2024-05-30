@@ -2,16 +2,17 @@ import os
 import yaml
 from tqdm import tqdm
 import torch
-import openai
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 from tenacity import (
     retry,
     stop_after_attempt,
     wait_random_exponential,
 )  # for exponential backoff
-import gradio as gr
 
-from chatcaptioner.blip2 import Blip2
-from chatcaptioner.utils import print_info, plot_img
+
+from ChatCaptioner.ChatCaptioner.chatcaptioner.utils import print_info, plot_img
+
+from PIL import Image
 
 
 QUESTION_INSTRUCTION = \
@@ -46,6 +47,7 @@ FIRST_QUESTION = 'Describe this image in detail.'
 
 VALID_CHATGPT_MODELS = ['gpt-3.5-turbo']
 VALID_GPT3_MODELS = ['text-davinci-003', 'text-davinci-002', 'davinci']
+OTHER_LLM = ['microsoft/Phi-3-mini-128k-instruct']
 
 
 
@@ -96,7 +98,7 @@ def prepare_gpt_prompt(task_prompt, questions, answers, sub_prompt):
 
 
 @retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(6))
-def call_gpt3(gpt3_prompt, max_tokens=40, model="text-davinci-003"):  # 'text-curie-001' does work at all to ask questions
+def  call_gpt3(gpt3_prompt, max_tokens=40, model="text-davinci-003"):  # 'text-curie-001' does work at all to ask questions
     response = openai.Completion.create(model=model, prompt=gpt3_prompt, max_tokens=max_tokens)  # temperature=0.6, 
     reply = response['choices'][0]['text']
     total_tokens = response['usage']['total_tokens']
@@ -114,6 +116,15 @@ def prepare_chatgpt_message(task_prompt, questions, answers, sub_prompt):
     
     return messages
 
+def prepare_phi_prompt(task_prompt, questions, answers, sub_prompt):
+    messages = [{"role": "user", "content": task_prompt}]
+
+    assert len(questions) == len(answers)
+    for q, a in zip(questions, answers):
+        messages.append({'role': 'assistant', 'content': 'Question: {}'.format(q)})
+        messages.append({'role': 'user', 'content': 'Answer: {}'.format(a)})
+    messages.append({"role": "system", "content": sub_prompt})
+    return messages
 
 @retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(6))
 def call_chatgpt(chatgpt_messages, max_tokens=40, model="gpt-3.5-turbo"):
@@ -122,15 +133,38 @@ def call_chatgpt(chatgpt_messages, max_tokens=40, model="gpt-3.5-turbo"):
     total_tokens = response['usage']['total_tokens']
     return reply, total_tokens
 
+def call_phi(messages, phi_model, max_tokens=30 ):
+    model = AutoModelForCausalLM.from_pretrained(
+        phi_model,
+        device_map="cuda",
+        torch_dtype="auto",
+        trust_remote_code=True,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(phi_model)
 
+    pipe = pipeline(
+        "text-generation",
+        model=model,
+        tokenizer=tokenizer,
+    )
+
+    generation_args = {
+        "max_new_tokens": max_tokens,
+        "return_full_text": False,
+        "temperature": 0.0,
+        "do_sample": False,
+    }
+    # TODO: Check if it outputs the number of tokens
+    output = pipe(messages, **generation_args)
+    return output[0]['generated_text'], max_tokens
 class AskQuestions():
 
-    def __init__(self, img, blip2, model, max_gpt_token=30, n_blip2_context=-1):
+    def __init__(self, img, vqa_model, llm, max_llm_tokens=30, n_context=-1):
         self.img = img
-        self.blip2 = blip2
-        self.model = model
-        self.max_gpt_token = max_gpt_token
-        self.n_blip2_context = n_blip2_context
+        self.vqa_model = vqa_model
+        self.llm = llm
+        self.max_llm_tokens = max_llm_tokens
+        self.n_context = n_context
 
         self.questions = []
         self.answers = []
@@ -147,33 +181,41 @@ class AskQuestions():
             # first question is given by human to request a general discription
             question = FIRST_QUESTION
         else:
-            if self.model in VALID_CHATGPT_MODELS:
+            if self.llm in VALID_CHATGPT_MODELS:
                 chatgpt_messages = prepare_chatgpt_message(
                     QUESTION_INSTRUCTION,
                     self.questions, self.answers,
                     SUB_QUESTION_INSTRUCTION
                 )
-                question, n_tokens = call_chatgpt(chatgpt_messages, model=self.model, max_tokens=self.max_gpt_token)
-            elif self.model in VALID_GPT3_MODELS:
+                question, n_tokens = call_chatgpt(chatgpt_messages, model=self.llm, max_tokens=self.max_llm_tokens)
+            elif self.llm in VALID_GPT3_MODELS:
                 # prepare the context for GPT3
                 gpt3_prompt = prepare_gpt_prompt(
                     QUESTION_INSTRUCTION,
                     self.questions, self.answers,
                     SUB_QUESTION_INSTRUCTION
                 )
-
-                question, n_tokens = call_gpt3(gpt3_prompt, model=self.model, max_tokens=self.max_gpt_token)
-            elif isinstance(self.model, Blip2):
-                # prepare the context for other LLM
-                gpt_prompt = prepare_gpt_prompt(
-                    QUESTION_INSTRUCTION,
-                    self.questions, self.answers,
-                    SUB_QUESTION_INSTRUCTION
-                )
-                n_tokens = 0  # local model. no token cost on OpenAI API.
-                question = self.model.call_llm(gpt_prompt)
+                question, n_tokens = call_gpt3(gpt3_prompt, model=self.llm, max_tokens=self.max_llm_tokens)
+            elif self.llm in OTHER_LLM:
+                if('phi' in self.llm):
+                    # prepare context for other models
+                    phi_prompt = prepare_phi_prompt(
+                        QUESTION_INSTRUCTION,
+                        self.questions, self.answers,
+                        SUB_QUESTION_INSTRUCTION
+                    )
+                    question, n_tokens = call_phi(phi_prompt, phi_model=self.llm, max_tokens=self.max_llm_tokens)
+                """elif isinstance(self.model, Blip2):
+                    # prepare the context for other LLM
+                    gpt_prompt = prepare_gpt_prompt(
+                        QUESTION_INSTRUCTION,
+                        self.questions, self.answers,
+                        SUB_QUESTION_INSTRUCTION
+                    )
+                    n_tokens = 0  # local model. no token cost on OpenAI API.
+                    question = self.model.call_llm(gpt_prompt)"""
             else:
-                raise ValueError('{} is not a valid question model'.format(self.model))
+                raise ValueError('{} is not a valid question model'.format(self.llm))
 
             self.total_tokens = self.total_tokens + n_tokens
 
@@ -190,12 +232,12 @@ class AskQuestions():
         return question
 
     def answer_question(self):
-        # prepare the context for blip2
-        blip2_prompt = '\n'.join([ANSWER_INSTRUCTION,
-                                  get_chat_log(self.questions, self.answers, last_n=self.n_blip2_context),
+        # prepare the context for vqa model
+        vqa_prompt = '\n'.join([ANSWER_INSTRUCTION,
+                                  get_chat_log(self.questions, self.answers, last_n=self.n_context),
                                   SUB_ANSWER_INSTRUCTION])
 
-        answer = self.blip2.ask(self.img, blip2_prompt)
+        answer = self.blip2.ask(self.img, vqa_prompt)
         return answer
 
     def answer_trim(self, answer):
@@ -262,21 +304,17 @@ def summarize_chat(questions, answers, model, max_gpt_token=100):
     return summary, summary_prompt, n_tokens
 
 
-def caption_image(blip2, image, model, n_rounds=10, n_blip2_context=-1, print_mode='no'):
-    if model == 'gpt3':
-        model = 'text-davinci-003'
-    elif model == 'chatgpt':
-        model = 'gpt-3.5-turbo'
+def caption_image(vqa_model, image, llm, n_rounds=10, n_context=-1, print_mode='no'):
     
     results = {}
     chat = AskQuestions(image,
-                        blip2,
-                        n_blip2_context=n_blip2_context,
-                        model=model)
+                        vqa_model,
+                        n_context=n_context,
+                        llm=llm)
 
     questions, answers, n_token_chat = chat.chatting(n_rounds, print_mode=print_mode)
 
-    summary, summary_prompt, n_token_sum = summarize_chat(questions, answers, model=model)
+    summary, summary_prompt, n_token_sum = summarize_chat(questions, answers, model=llm)
     results['ChatCaptioner'] = {'caption': summary, 'chat': summary_prompt, 'n_token': n_token_chat + n_token_sum}
     results['BLIP2+OurPrompt'] = {'caption': answers[0]}
 
@@ -287,7 +325,7 @@ def caption_image(blip2, image, model, n_rounds=10, n_blip2_context=-1, print_mo
     return results
 
 
-def caption_images(blip2s, dataset, img_ids, model, save_path='', n_rounds=10, n_blip2_context=-1, print_mode='no'):
+def caption_images(vqa_model, dataset, model, save_path='', n_rounds=10, n_context=-1, print_mode='no'):
     """
     Caption images with a set of blip2 models
 
@@ -303,34 +341,28 @@ def caption_images(blip2s, dataset, img_ids, model, save_path='', n_rounds=10, n
         n_blip2_context (int): how many previous QA rounds can blip2 see. negative value means blip2 can see all 
         print_mode (str): print mode. 'chat' for printing everying. 'bar' for printing everthing but the chat process. 'no' for no printing
     """
-    if model == 'gpt3':
-        model = 'text-davinci-003'
-    elif model == 'chatgpt':
-        model = 'gpt-3.5-turbo'
-    
-    for img_id in tqdm(img_ids, disable=print_mode!='no'):
-        caption_path = os.path.join(save_path, 'caption_result', '{}.yaml'.format(img_id))
+    for idx in range(dataset.__len__()):
+        caption_path = os.path.join(save_path, 'caption_result', '{}.yaml'.format(idx))
         if os.path.exists(caption_path):
             continue
         if print_mode != 'no':
-            print('Image ID {}'.format(img_id))
-            
-        image, gt_captions = dataset.fetch_img(img_id)
+            print('Image ID {}'.format(idx))
+
+        image, _,_,_ = dataset[idx]
         info = {'setting':
                     {'dataset': dataset.name,
-                     'id': img_id,
-                     'GT': {'caption': [caption.replace('\n', ' ').strip() for caption in gt_captions]},
+                     'id': idx,
                      'n_rounds': n_rounds
                     }
                }
 
-        for blip2_tag, blip2 in blip2s.items():
-            info[blip2_tag] = caption_image(blip2, 
-                                            image, 
-                                            n_rounds=n_rounds, 
-                                            n_blip2_context=n_blip2_context, 
-                                            model=model,
-                                            print_mode=print_mode)
+
+        info['x2_vlm'] = caption_image(vqa_model,
+                                        image,
+                                        n_rounds=n_rounds,
+                                        n_blip2_context=n_context,
+                                        model=model,
+                                        print_mode=print_mode)
 
         if print_mode != 'no':
             print_info(info)
